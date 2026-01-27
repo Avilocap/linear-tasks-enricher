@@ -10,8 +10,11 @@ When a new task is created in Linear, the service:
 
 1. Receives the webhook from Linear
 2. Runs `git pull` on the project repositories
-3. Invokes Claude Code to analyze the codebases
-4. Updates the task description in Linear with:
+3. Extracts media from the task description:
+   - **Images** — downloaded locally for Claude to read
+   - **Videos** — audio extracted with ffmpeg and transcribed via OpenAI Whisper
+4. Invokes Claude Code to analyze the codebases (including media context)
+5. Updates the task description in Linear with:
    - **Implementation approach** — concrete steps referencing actual files and functions
    - **Technical context** — architecture patterns, dependencies, and relevant utilities
    - **Complexity** — estimate (Low / Medium / High) with justification
@@ -22,11 +25,12 @@ It also supports on-demand enrichment of existing tasks.
 ## Architecture
 
 ```
-Linear webhook → Cloudflare Tunnel → Express server → Claude Code CLI → Linear MCP update
+Linear webhook → Cloudflare Tunnel → Express server → Media processing → Claude Code CLI → Linear MCP update
 ```
 
 - **Express** receives webhooks and manual requests
 - **Cloudflare Tunnel** exposes the local server to the internet with a fixed URL
+- **ffmpeg + OpenAI Whisper** extract and transcribe audio from attached videos
 - **Claude Code** (`claude -p`) analyzes the codebase in non-interactive mode
 - **Linear MCP** allows Claude to read and update tasks directly
 
@@ -37,6 +41,7 @@ Linear webhook → Cloudflare Tunnel → Express server → Claude Code CLI → 
 - Node.js 20+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 - [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/)
+- [ffmpeg](https://ffmpeg.org/) (for video audio extraction)
 - Linear MCP configured in Claude Code (`claude mcp add`)
 
 ### Installation
@@ -54,6 +59,8 @@ Edit `.env`:
 PORT=3000
 LINEAR_WEBHOOK_SECRET=your_signing_secret
 LINEAR_TEAM_KEY=YOUR_TEAM_KEY
+LINEAR_API_KEY=lin_api_your_key
+OPENAI_API_KEY=sk-your_key
 ```
 
 ### Cloudflare Tunnel
@@ -115,6 +122,9 @@ launchctl load ~/Library/LaunchAgents/com.example.tasks-enricher-tunnel.plist
 # Stop
 launchctl unload ~/Library/LaunchAgents/com.example.tasks-enricher.plist
 launchctl unload ~/Library/LaunchAgents/com.example.tasks-enricher-tunnel.plist
+
+# Restart
+./restart.sh
 
 # Logs
 tail -f logs/server.log
