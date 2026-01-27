@@ -11,6 +11,37 @@ const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 
 const REPOS = ["z2-backend", "z2-frontend"];
 
+const ENRICHING_BANNER = `> ⏳ **Enriqueciendo tarea…** El análisis técnico se está generando automáticamente.\n\n---\n\n`;
+
+/**
+ * Update the description of a Linear issue via GraphQL API.
+ */
+async function updateIssueDescription(issueId, description) {
+  const res = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: LINEAR_API_KEY,
+    },
+    body: JSON.stringify({
+      query: `mutation($id: String!, $description: String!) {
+        issueUpdate(id: $id, input: { description: $description }) {
+          success
+        }
+      }`,
+      variables: { id: issueId, description },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Linear API error: ${res.status} ${await res.text()}`);
+  }
+  const body = await res.json();
+  if (body.errors) {
+    throw new Error(`Linear GraphQL error: ${JSON.stringify(body.errors)}`);
+  }
+  return body.data.issueUpdate.success;
+}
+
 /**
  * Fetch a URL, adding Linear auth headers for uploads.linear.app URLs.
  */
@@ -443,6 +474,15 @@ export async function enrichTaskByIdentifier(identifier) {
  * Main enrichment pipeline.
  */
 export async function enrichTask(task) {
+  // Step 0: Mark the task as "enriching" in Linear
+  try {
+    const bannerDescription = ENRICHING_BANNER + (task.description || "");
+    await updateIssueDescription(task.id, bannerDescription);
+    console.log(`[ENRICH] Marked ${task.identifier} as enriching`);
+  } catch (err) {
+    console.warn(`[ENRICH] Failed to set enriching banner: ${err.message}`);
+  }
+
   // Step 1: Pull latest code
   try {
     await pullRepos();
