@@ -7,8 +7,20 @@ const MEDIA_DIR = path.join(PROJECT_ROOT, ".tmp-media");
 const IMAGES_DIR = path.join(MEDIA_DIR, "images");
 const VIDEO_DIR = path.join(MEDIA_DIR, "video");
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 
 const REPOS = ["z2-backend", "z2-frontend"];
+
+/**
+ * Fetch a URL, adding Linear auth headers for uploads.linear.app URLs.
+ */
+function fetchWithAuth(url) {
+  if (LINEAR_API_KEY && url.includes("uploads.linear.app")) {
+    console.log(`[AUTH] Fetching Linear upload with API key`);
+    return fetch(url, { headers: { Authorization: LINEAR_API_KEY } });
+  }
+  return fetch(url);
+}
 
 /**
  * Run git pull on all configured repos.
@@ -60,7 +72,7 @@ async function downloadImages(urls, taskIdentifier) {
     const url = urls[i];
     try {
       console.log(`[IMAGES] Downloading image ${i + 1}/${urls.length}: ${url.slice(0, 80)}...`);
-      const res = await fetch(url);
+      const res = await fetchWithAuth(url);
       if (!res.ok) {
         console.warn(`[IMAGES] Failed to download ${url}: ${res.status}`);
         continue;
@@ -139,9 +151,13 @@ async function transcribeVideo(url, taskIdentifier, index) {
 
   // Download video
   console.log(`[VIDEO] Downloading video ${index}: ${url.slice(0, 80)}...`);
-  const res = await fetch(url);
+  const res = await fetchWithAuth(url);
   if (!res.ok) {
-    console.warn(`[VIDEO] Failed to download: ${res.status}`);
+    const errBody = await res.text().catch(() => "");
+    console.log(`[VIDEO] Failed to download: ${res.status} ${res.statusText}`);
+    console.log(`[VIDEO] Response headers: ${JSON.stringify(Object.fromEntries(res.headers))}`);
+    console.log(`[VIDEO] Response body: ${errBody.slice(0, 500)}`);
+    console.log(`[VIDEO] Full URL: ${url}`);
     return null;
   }
 
