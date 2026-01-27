@@ -23,9 +23,9 @@ async function pullRepos() {
 }
 
 /**
- * Extract image URLs from markdown text.
+ * Extract image URLs from markdown text, excluding video URLs.
  */
-function extractImageUrls(text) {
+function extractImageUrls(text, videoUrls = []) {
   if (!text) return [];
   const urls = [];
   // Markdown images: ![alt](url)
@@ -36,11 +36,12 @@ function extractImageUrls(text) {
   for (const match of text.matchAll(/https?:\/\/[^\s)]+\.(?:png|jpg|jpeg|gif|webp|svg)/gi)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
-  // Linear upload URLs (may not have extension)
+  // Linear upload URLs (may not have extension) — only if not already a video
   for (const match of text.matchAll(/(https?:\/\/uploads\.linear\.app\/[^\s)]+)/g)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
-  return urls;
+  // Exclude any URL already identified as video
+  return urls.filter((u) => !videoUrls.includes(u));
 }
 
 /**
@@ -101,19 +102,24 @@ const VIDEO_CONTENT_TYPES = ["video/mp4", "video/quicktime", "video/webm", "vide
 
 /**
  * Extract video URLs from markdown text.
+ * Checks both the link text and the URL for video extensions.
  */
 function extractVideoUrls(text) {
   if (!text) return [];
   const urls = [];
-  // Markdown links to video files
-  for (const match of text.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
-    if (VIDEO_EXTENSIONS.test(match[1])) urls.push(match[1]);
+  // Markdown links: check link text OR URL for video extensions
+  for (const match of text.matchAll(/\[([^\]]*)\]\(([^)]+)\)/g)) {
+    const linkText = match[1];
+    const linkUrl = match[2];
+    if (VIDEO_EXTENSIONS.test(linkText) || VIDEO_EXTENSIONS.test(linkUrl)) {
+      if (!urls.includes(linkUrl)) urls.push(linkUrl);
+    }
   }
   // Raw URLs ending in video extensions
   for (const match of text.matchAll(/https?:\/\/[^\s)]+\.(?:mp4|mov|webm|avi|mkv)/gi)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
-  // Linear upload URLs with video in path (e.g. /video/ segment or content-type hint)
+  // Linear upload URLs with video in path
   for (const match of text.matchAll(/(https?:\/\/uploads\.linear\.app\/[^\s)]*video[^\s)]*)/gi)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
@@ -263,8 +269,7 @@ Se ha creado una nueva tarea:
 
 Tu trabajo:
 
-1. Analiza los codebases en este directorio (z2-backend y z2-frontend) para entender qué partes del código son relevantes para esta tarea.
-2. Produce un enriquecimiento técnico que incluya:
+1. Produce un enriquecimiento técnico que incluya:
    - **Enfoque de implementación**: Un enfoque paso a paso sugerido para implementar la tarea.
    - **Contexto técnico**: Patrones de arquitectura, dependencias o utilidades existentes que el desarrollador debería conocer.
    - **Estimación de complejidad**: Baja / Media / Alta con justificación.
@@ -272,7 +277,7 @@ Tu trabajo:
      - **Funcionalidad**: Comportamiento esperado paso a paso, incluyendo casos edge, validaciones, endpoints involucrados, y qué debe ocurrir en caso de éxito y error.
      - **UX**: Aspectos de experiencia de usuario como flujos de confirmación, información contextual, internacionalización, estados de carga, y feedback visual.
      - **Técnico**: Requisitos técnicos como ausencia de errores de tipado, patrones del proyecto a seguir, hooks o utilidades a reutilizar, y convenciones del codebase.
-3. Usa la herramienta MCP de Linear (update_issue) para **actualizar la descripción de la tarea**. El ID de la tarea es: \`${task.id}\`
+2. Usa la herramienta MCP de Linear (update_issue) para **actualizar la descripción de la tarea**. El ID de la tarea es: \`${task.id}\`
 
 Al actualizar la descripción, conserva la descripción original y añade tu análisis debajo usando este formato:
 
@@ -424,16 +429,19 @@ export async function enrichTask(task) {
     console.warn(`[GIT] Pull failed (continuing anyway): ${err.message}`);
   }
 
-  // Step 2: Download images from description
-  const imageUrls = extractImageUrls(task.description);
+  // Step 2: Detect videos first (so we can exclude them from image extraction)
+  const videoUrls = extractVideoUrls(task.description);
+  const transcriptions = videoUrls.length > 0
+    ? await processVideos(task.description, task.identifier)
+    : [];
+
+  // Step 3: Download images (excluding video URLs)
+  const imageUrls = extractImageUrls(task.description, videoUrls);
   let imagePaths = [];
   if (imageUrls.length > 0) {
     console.log(`[IMAGES] Found ${imageUrls.length} image(s) in ${task.identifier}`);
     imagePaths = await downloadImages(imageUrls, task.identifier);
   }
-
-  // Step 3: Transcribe videos from description
-  const transcriptions = await processVideos(task.description, task.identifier);
 
   // Step 4: Run Claude to analyze and update the task
   try {
