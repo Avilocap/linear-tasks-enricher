@@ -3,9 +3,24 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const PROJECT_ROOT = process.env.PROJECT_ROOT || path.resolve(import.meta.dirname, "..");
-const IMAGES_DIR = path.join(PROJECT_ROOT, ".tmp-images");
+const MEDIA_DIR = path.join(PROJECT_ROOT, ".tmp-media");
+const IMAGES_DIR = path.join(MEDIA_DIR, "images");
+const VIDEO_DIR = path.join(MEDIA_DIR, "video");
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 
 const REPOS = ["z2-backend", "z2-frontend"];
+
+/**
+ * Fetch a URL, adding Linear auth headers for uploads.linear.app URLs.
+ */
+function fetchWithAuth(url) {
+  if (LINEAR_API_KEY && url.includes("uploads.linear.app")) {
+    console.log(`[AUTH] Fetching Linear upload with API key`);
+    return fetch(url, { headers: { Authorization: LINEAR_API_KEY } });
+  }
+  return fetch(url);
+}
 
 /**
  * Run git pull on all configured repos.
@@ -20,9 +35,9 @@ async function pullRepos() {
 }
 
 /**
- * Extract image URLs from markdown text.
+ * Extract image URLs from markdown text, excluding video URLs.
  */
-function extractImageUrls(text) {
+function extractImageUrls(text, videoUrls = []) {
   if (!text) return [];
   const urls = [];
   // Markdown images: ![alt](url)
@@ -33,11 +48,12 @@ function extractImageUrls(text) {
   for (const match of text.matchAll(/https?:\/\/[^\s)]+\.(?:png|jpg|jpeg|gif|webp|svg)/gi)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
-  // Linear upload URLs (may not have extension)
+  // Linear upload URLs (may not have extension) — only if not already a video
   for (const match of text.matchAll(/(https?:\/\/uploads\.linear\.app\/[^\s)]+)/g)) {
     if (!urls.includes(match[0])) urls.push(match[0]);
   }
-  return urls;
+  // Exclude any URL already identified as video
+  return urls.filter((u) => !videoUrls.includes(u));
 }
 
 /**
@@ -56,7 +72,7 @@ async function downloadImages(urls, taskIdentifier) {
     const url = urls[i];
     try {
       console.log(`[IMAGES] Downloading image ${i + 1}/${urls.length}: ${url.slice(0, 80)}...`);
-      const res = await fetch(url);
+      const res = await fetchWithAuth(url);
       if (!res.ok) {
         console.warn(`[IMAGES] Failed to download ${url}: ${res.status}`);
         continue;
@@ -93,10 +109,174 @@ async function cleanupImages(taskIdentifier) {
   } catch {}
 }
 
+const VIDEO_EXTENSIONS = /\.(?:mp4|mov|webm|avi|mkv)/i;
+const VIDEO_CONTENT_TYPES = ["video/mp4", "video/quicktime", "video/webm", "video/avi"];
+
+/**
+ * Extract video URLs from markdown text.
+ * Checks both the link text and the URL for video extensions.
+ */
+function extractVideoUrls(text) {
+  if (!text) return [];
+  const urls = [];
+  // Markdown links: check link text OR URL for video extensions
+  for (const match of text.matchAll(/\[([^\]]*)\]\(([^)]+)\)/g)) {
+    const linkText = match[1];
+    const linkUrl = match[2];
+    if (VIDEO_EXTENSIONS.test(linkText) || VIDEO_EXTENSIONS.test(linkUrl)) {
+      if (!urls.includes(linkUrl)) urls.push(linkUrl);
+    }
+  }
+  // Raw URLs ending in video extensions
+  for (const match of text.matchAll(/https?:\/\/[^\s)]+\.(?:mp4|mov|webm|avi|mkv)/gi)) {
+    if (!urls.includes(match[0])) urls.push(match[0]);
+  }
+  // Linear upload URLs with video in path
+  for (const match of text.matchAll(/(https?:\/\/uploads\.linear\.app\/[^\s)]*video[^\s)]*)/gi)) {
+    if (!urls.includes(match[0])) urls.push(match[0]);
+  }
+  return urls;
+}
+
+/**
+ * Download a video, extract audio with ffmpeg, and transcribe with Whisper.
+ * Returns the transcription text or null.
+ */
+async function transcribeVideo(url, taskIdentifier, index) {
+  const taskDir = path.join(VIDEO_DIR, taskIdentifier);
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const videoPath = path.join(taskDir, `video-${index}.mp4`);
+  const audioPath = path.join(taskDir, `audio-${index}.mp3`);
+
+  // Download video
+  console.log(`[VIDEO] Downloading video ${index}: ${url.slice(0, 80)}...`);
+  const res = await fetchWithAuth(url);
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    console.log(`[VIDEO] Failed to download: ${res.status} ${res.statusText}`);
+    console.log(`[VIDEO] Response headers: ${JSON.stringify(Object.fromEntries(res.headers))}`);
+    console.log(`[VIDEO] Response body: ${errBody.slice(0, 500)}`);
+    console.log(`[VIDEO] Full URL: ${url}`);
+    return null;
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const isVideo = VIDEO_CONTENT_TYPES.some((t) => contentType.includes(t))
+    || VIDEO_EXTENSIONS.test(url);
+
+  if (!isVideo && !contentType.includes("octet-stream")) {
+    console.log(`[VIDEO] URL is not a video (content-type: ${contentType}), skipping`);
+    return null;
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  await fs.writeFile(videoPath, buffer);
+  console.log(`[VIDEO] Saved: ${videoPath} (${(buffer.length / 1024 / 1024).toFixed(1)}MB)`);
+
+  // Extract audio with ffmpeg
+  console.log(`[VIDEO] Extracting audio...`);
+  const ffmpegResult = await exec("ffmpeg", [
+    "-i", videoPath,
+    "-vn",
+    "-acodec", "libmp3lame",
+    "-q:a", "4",
+    "-y",
+    audioPath,
+  ], { timeout: 120_000 });
+
+  if (ffmpegResult.exitCode !== 0) {
+    console.warn(`[VIDEO] ffmpeg failed: ${ffmpegResult.stderr.slice(0, 200)}`);
+    return null;
+  }
+
+  // Check audio file exists and has content
+  try {
+    const audioStat = await fs.stat(audioPath);
+    if (audioStat.size < 1000) {
+      console.log(`[VIDEO] Audio too small (${audioStat.size}B), video may have no audio track`);
+      return null;
+    }
+    console.log(`[VIDEO] Audio extracted: ${(audioStat.size / 1024).toFixed(0)}KB`);
+  } catch {
+    console.warn(`[VIDEO] No audio file produced`);
+    return null;
+  }
+
+  // Transcribe with OpenAI Whisper
+  if (!OPENAI_API_KEY) {
+    console.warn(`[VIDEO] OPENAI_API_KEY not set, skipping transcription`);
+    return null;
+  }
+
+  console.log(`[VIDEO] Transcribing with Whisper...`);
+  const audioBuffer = await fs.readFile(audioPath);
+  const formData = new FormData();
+  formData.append("file", new Blob([audioBuffer], { type: "audio/mpeg" }), "audio.mp3");
+  formData.append("model", "whisper-1");
+  formData.append("language", "es");
+
+  const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData,
+  });
+
+  if (!whisperRes.ok) {
+    const err = await whisperRes.text();
+    console.warn(`[VIDEO] Whisper API error: ${whisperRes.status} ${err.slice(0, 200)}`);
+    return null;
+  }
+
+  const { text } = await whisperRes.json();
+  console.log(`[VIDEO] Transcription: ${text.slice(0, 100)}...`);
+
+  // Save transcription to file to avoid ARG_MAX limits on long videos
+  const transcriptPath = path.join(taskDir, `transcription-${index}.txt`);
+  await fs.writeFile(transcriptPath, text, "utf-8");
+  console.log(`[VIDEO] Transcription saved: ${transcriptPath}`);
+  return transcriptPath;
+}
+
+/**
+ * Process all video URLs from a task description.
+ * Returns array of transcription file paths.
+ */
+async function processVideos(description, taskIdentifier) {
+  const videoUrls = extractVideoUrls(description);
+  if (videoUrls.length === 0) return [];
+
+  console.log(`[VIDEO] Found ${videoUrls.length} video(s) in ${taskIdentifier}`);
+  const transcriptionPaths = [];
+
+  for (let i = 0; i < videoUrls.length; i++) {
+    try {
+      const filePath = await transcribeVideo(videoUrls[i], taskIdentifier, i + 1);
+      if (filePath) transcriptionPaths.push(filePath);
+    } catch (err) {
+      console.warn(`[VIDEO] Error processing video ${i + 1}: ${err.message}`);
+    }
+  }
+
+  return transcriptionPaths;
+}
+
+/**
+ * Clean up all temp media for a task.
+ */
+async function cleanupMedia(taskIdentifier) {
+  for (const dir of [IMAGES_DIR, VIDEO_DIR]) {
+    const taskDir = path.join(dir, taskIdentifier);
+    try {
+      await fs.rm(taskDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 /**
  * Build the prompt that Claude will use to analyze the task and update it.
  */
-function buildPrompt(task, imagePaths = []) {
+function buildPrompt(task, imagePaths = [], transcriptionPaths = []) {
   return `Eres un asistente de ingeniería que enriquece tareas de Linear con contexto técnico. Responde siempre en español.
 
 Se ha creado una nueva tarea:
@@ -110,8 +290,7 @@ Se ha creado una nueva tarea:
 
 Tu trabajo:
 
-1. Analiza los codebases en este directorio (z2-backend y z2-frontend) para entender qué partes del código son relevantes para esta tarea.
-2. Produce un enriquecimiento técnico que incluya:
+1. Produce un enriquecimiento técnico que incluya:
    - **Enfoque de implementación**: Un enfoque paso a paso sugerido para implementar la tarea.
    - **Contexto técnico**: Patrones de arquitectura, dependencias o utilidades existentes que el desarrollador debería conocer.
    - **Estimación de complejidad**: Baja / Media / Alta con justificación.
@@ -119,7 +298,7 @@ Tu trabajo:
      - **Funcionalidad**: Comportamiento esperado paso a paso, incluyendo casos edge, validaciones, endpoints involucrados, y qué debe ocurrir en caso de éxito y error.
      - **UX**: Aspectos de experiencia de usuario como flujos de confirmación, información contextual, internacionalización, estados de carga, y feedback visual.
      - **Técnico**: Requisitos técnicos como ausencia de errores de tipado, patrones del proyecto a seguir, hooks o utilidades a reutilizar, y convenciones del codebase.
-3. Usa la herramienta MCP de Linear (update_issue) para **actualizar la descripción de la tarea**. El ID de la tarea es: \`${task.id}\`
+2. Usa la herramienta MCP de Linear (update_issue) para **actualizar la descripción de la tarea**. El ID de la tarea es: \`${task.id}\`
 
 Al actualizar la descripción, conserva la descripción original y añade tu análisis debajo usando este formato:
 
@@ -169,14 +348,19 @@ Importante:
 La tarea incluye ${imagePaths.length} imagen(es) adjunta(s). Léelas con la herramienta Read para entender el contexto visual (capturas de pantalla, mockups, errores, etc.):
 ${imagePaths.map((p) => `- ${p}`).join("\n")}
 
-Incorpora lo que observes en las imágenes a tu análisis.` : ""}`;
+Incorpora lo que observes en las imágenes a tu análisis.` : ""}${transcriptionPaths.length > 0 ? `
+
+La tarea incluye ${transcriptionPaths.length} vídeo(s) con audio. Las transcripciones están guardadas en archivos. Léelas con la herramienta Read para entender el contexto:
+${transcriptionPaths.map((p) => `- ${p}`).join("\n")}
+
+Incorpora el contenido de las transcripciones a tu análisis.` : ""}`;
 }
 
 /**
  * Invoke Claude Code CLI to analyze the task and update Linear.
  */
-async function runClaude(task, imagePaths = []) {
-  const prompt = buildPrompt(task, imagePaths);
+async function runClaude(task, imagePaths = [], transcriptionPaths = []) {
+  const prompt = buildPrompt(task, imagePaths, transcriptionPaths);
 
   const allowedTools = [
     "Read",
@@ -266,19 +450,25 @@ export async function enrichTask(task) {
     console.warn(`[GIT] Pull failed (continuing anyway): ${err.message}`);
   }
 
-  // Step 2: Download images from description
-  const imageUrls = extractImageUrls(task.description);
+  // Step 2: Detect videos first (so we can exclude them from image extraction)
+  const videoUrls = extractVideoUrls(task.description);
+  const transcriptionPaths = videoUrls.length > 0
+    ? await processVideos(task.description, task.identifier)
+    : [];
+
+  // Step 3: Download images (excluding video URLs)
+  const imageUrls = extractImageUrls(task.description, videoUrls);
   let imagePaths = [];
   if (imageUrls.length > 0) {
     console.log(`[IMAGES] Found ${imageUrls.length} image(s) in ${task.identifier}`);
     imagePaths = await downloadImages(imageUrls, task.identifier);
   }
 
-  // Step 3: Run Claude to analyze and update the task
+  // Step 4: Run Claude to analyze and update the task
   try {
-    await runClaude(task, imagePaths);
+    await runClaude(task, imagePaths, transcriptionPaths);
   } finally {
-    await cleanupImages(task.identifier);
+    await cleanupMedia(task.identifier);
   }
 }
 

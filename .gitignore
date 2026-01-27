@@ -2,5 +2,5 @@ node_modules/
 .env
 z2-backend/
 z2-frontend/
-.tmp-images/
+.tmp-media/
 logs/
