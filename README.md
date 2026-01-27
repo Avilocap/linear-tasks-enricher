@@ -1,43 +1,43 @@
 # Linear Tasks Enricher
 
-Servicio que enriquece automáticamente las tareas de Linear con contexto técnico extraído del codebase, usando Claude Code.
+A service that automatically enriches Linear tasks with technical context extracted from the codebase, using Claude Code.
 
-## Qué hace
+## What it does
 
-Cuando se crea una tarea nueva en Linear, el servicio:
+When a new task is created in Linear, the service:
 
-1. Recibe el webhook de Linear
-2. Hace `git pull` de los repositorios del proyecto
-3. Invoca Claude Code para analizar los codebases
-4. Actualiza la descripción de la tarea en Linear con:
-   - **Enfoque de implementación** — pasos concretos con referencias a archivos y funciones reales
-   - **Contexto técnico** — patrones de arquitectura, dependencias y utilidades relevantes
-   - **Complejidad** — estimación (Baja / Media / Alta) con justificación
-   - **Criterios de aceptación** — divididos en Funcionalidad, UX y Técnico, específicos al codebase
+1. Receives the webhook from Linear
+2. Runs `git pull` on the project repositories
+3. Invokes Claude Code to analyze the codebases
+4. Updates the task description in Linear with:
+   - **Implementation approach** — concrete steps referencing actual files and functions
+   - **Technical context** — architecture patterns, dependencies, and relevant utilities
+   - **Complexity** — estimate (Low / Medium / High) with justification
+   - **Acceptance criteria** — split into Functionality, UX, and Technical, specific to the codebase
 
-También permite enriquecer tareas ya existentes bajo demanda.
+It also supports on-demand enrichment of existing tasks.
 
-## Arquitectura
+## Architecture
 
 ```
 Linear webhook → Cloudflare Tunnel → Express server → Claude Code CLI → Linear MCP update
 ```
 
-- **Express** recibe webhooks y peticiones manuales
-- **Cloudflare Tunnel** expone el servidor local a internet con URL fija
-- **Claude Code** (`claude -p`) analiza el codebase en modo no interactivo
-- **Linear MCP** permite a Claude leer y actualizar tareas directamente
+- **Express** receives webhooks and manual requests
+- **Cloudflare Tunnel** exposes the local server to the internet with a fixed URL
+- **Claude Code** (`claude -p`) analyzes the codebase in non-interactive mode
+- **Linear MCP** allows Claude to read and update tasks directly
 
 ## Setup
 
-### Requisitos
+### Requirements
 
 - Node.js 20+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 - [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/)
-- MCP de Linear configurado en Claude Code (`claude mcp add`)
+- Linear MCP configured in Claude Code (`claude mcp add`)
 
-### Instalación
+### Installation
 
 ```bash
 git clone https://github.com/Avilocap/linear-tasks-enricher.git
@@ -46,12 +46,12 @@ npm install
 cp .env.example .env
 ```
 
-Edita `.env`:
+Edit `.env`:
 
 ```
 PORT=3000
-LINEAR_WEBHOOK_SECRET=tu_signing_secret
-LINEAR_TEAM_KEY=TU_TEAM_KEY
+LINEAR_WEBHOOK_SECRET=your_signing_secret
+LINEAR_TEAM_KEY=YOUR_TEAM_KEY
 ```
 
 ### Cloudflare Tunnel
@@ -59,58 +59,58 @@ LINEAR_TEAM_KEY=TU_TEAM_KEY
 ```bash
 cloudflared login
 cloudflared tunnel create tasks-enricher
-cloudflared tunnel route dns tasks-enricher tu-subdominio.tudominio.com
+cloudflared tunnel route dns tasks-enricher your-subdomain.yourdomain.com
 ```
 
-### Webhook en Linear
+### Linear Webhook
 
-Settings → API → Webhooks → Crear webhook:
-- **URL**: `https://tu-subdominio.tudominio.com/webhook`
+Settings → API → Webhooks → Create webhook:
+- **URL**: `https://your-subdomain.yourdomain.com/webhook`
 - **Resource types**: Issues
 - **Actions**: Create
 
-Copia el signing secret a `LINEAR_WEBHOOK_SECRET` en `.env`.
+Copy the signing secret to `LINEAR_WEBHOOK_SECRET` in `.env`.
 
-### Arrancar
+### Start
 
 ```bash
 ./start.sh
 ```
 
-Para ejecución desatendida en macOS, usar launchd (ver sección más abajo).
+For unattended execution on macOS, use launchd (see section below).
 
 ## Endpoints
 
-| Método | Ruta | Auth | Descripción |
+| Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/webhook` | Linear signature | Recibe webhooks de Linear |
-| `POST` | `/enrich` | Bearer token | Enriquece tareas existentes |
+| `POST` | `/webhook` | Linear signature | Receives Linear webhooks |
+| `POST` | `/enrich` | Bearer token | Enriches existing tasks on demand |
 | `GET` | `/health` | — | Health check |
 
-### Enriquecer tareas existentes
+### Enrich existing tasks
 
 ```bash
-curl -X POST https://tu-subdominio.tudominio.com/enrich \
+curl -X POST https://your-subdomain.yourdomain.com/enrich \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer TU_WEBHOOK_SECRET" \
+  -H "Authorization: Bearer YOUR_WEBHOOK_SECRET" \
   -d '{"issues": ["TEAM-123", "TEAM-456"]}'
 ```
 
-## Ejecución desatendida (macOS launchd)
+## Unattended execution (macOS launchd)
 
-Crear dos plists en `~/Library/LaunchAgents/`:
+Create two plists in `~/Library/LaunchAgents/`:
 
-- `com.example.tasks-enricher.plist` — servidor Node
-- `com.example.tasks-enricher-tunnel.plist` — túnel Cloudflare
+- `com.example.tasks-enricher.plist` — Node server
+- `com.example.tasks-enricher-tunnel.plist` — Cloudflare tunnel
 
-Ambos con `RunAtLoad` y `KeepAlive` activados. Gestión:
+Both with `RunAtLoad` and `KeepAlive` enabled. Management:
 
 ```bash
-# Arrancar
+# Start
 launchctl load ~/Library/LaunchAgents/com.example.tasks-enricher.plist
 launchctl load ~/Library/LaunchAgents/com.example.tasks-enricher-tunnel.plist
 
-# Parar
+# Stop
 launchctl unload ~/Library/LaunchAgents/com.example.tasks-enricher.plist
 launchctl unload ~/Library/LaunchAgents/com.example.tasks-enricher-tunnel.plist
 
@@ -120,4 +120,4 @@ tail -f logs/server.log
 
 ---
 
-> **Nota**: El 100% del código de este proyecto ha sido generado usando inteligencia artificial (Claude Code de Anthropic).
+> **Note**: 100% of the code in this project was generated using artificial intelligence (Anthropic's Claude Code).
