@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import path from "node:path";
 
 const PROJECT_ROOT = process.env.PROJECT_ROOT || path.resolve(import.meta.dirname, "..");
+const IMAGES_DIR = path.join(PROJECT_ROOT, ".tmp-images");
 
 const REPOS = ["z2-backend", "z2-frontend"];
 
@@ -18,9 +20,83 @@ async function pullRepos() {
 }
 
 /**
+ * Extract image URLs from markdown text.
+ */
+function extractImageUrls(text) {
+  if (!text) return [];
+  const urls = [];
+  // Markdown images: ![alt](url)
+  for (const match of text.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    urls.push(match[1]);
+  }
+  // Raw URLs ending in image extensions
+  for (const match of text.matchAll(/https?:\/\/[^\s)]+\.(?:png|jpg|jpeg|gif|webp|svg)/gi)) {
+    if (!urls.includes(match[0])) urls.push(match[0]);
+  }
+  // Linear upload URLs (may not have extension)
+  for (const match of text.matchAll(/(https?:\/\/uploads\.linear\.app\/[^\s)]+)/g)) {
+    if (!urls.includes(match[0])) urls.push(match[0]);
+  }
+  return urls;
+}
+
+/**
+ * Download images from URLs to local temp directory.
+ * Returns array of local file paths.
+ */
+async function downloadImages(urls, taskIdentifier) {
+  if (urls.length === 0) return [];
+
+  const taskDir = path.join(IMAGES_DIR, taskIdentifier);
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const paths = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
+    try {
+      console.log(`[IMAGES] Downloading image ${i + 1}/${urls.length}: ${url.slice(0, 80)}...`);
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.warn(`[IMAGES] Failed to download ${url}: ${res.status}`);
+        continue;
+      }
+
+      const contentType = res.headers.get("content-type") || "";
+      const ext = contentType.includes("png") ? ".png"
+        : contentType.includes("jpeg") || contentType.includes("jpg") ? ".jpg"
+        : contentType.includes("gif") ? ".gif"
+        : contentType.includes("webp") ? ".webp"
+        : contentType.includes("svg") ? ".svg"
+        : ".png";
+
+      const filePath = path.join(taskDir, `image-${i + 1}${ext}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      await fs.writeFile(filePath, buffer);
+      paths.push(filePath);
+      console.log(`[IMAGES] Saved: ${filePath}`);
+    } catch (err) {
+      console.warn(`[IMAGES] Error downloading ${url}: ${err.message}`);
+    }
+  }
+
+  return paths;
+}
+
+/**
+ * Clean up downloaded images for a task.
+ */
+async function cleanupImages(taskIdentifier) {
+  const taskDir = path.join(IMAGES_DIR, taskIdentifier);
+  try {
+    await fs.rm(taskDir, { recursive: true, force: true });
+  } catch {}
+}
+
+/**
  * Build the prompt that Claude will use to analyze the task and update it.
  */
-function buildPrompt(task) {
+function buildPrompt(task, imagePaths = []) {
   return `Eres un asistente de ingeniería que enriquece tareas de Linear con contexto técnico. Responde siempre en español.
 
 Se ha creado una nueva tarea:
@@ -88,14 +164,19 @@ Importante:
 - NO modifiques ningún archivo del codebase. Solo lee y analiza.
 - Usa la herramienta mcp__linear-server__update_issue para actualizar la descripción de la tarea.
 - Escribe TODO el análisis en español.
-- Los criterios de aceptación deben ser específicos al codebase real (nombres de hooks, componentes, endpoints, archivos de traducción, etc.), no genéricos.`;
+- Los criterios de aceptación deben ser específicos al codebase real (nombres de hooks, componentes, endpoints, archivos de traducción, etc.), no genéricos.${imagePaths.length > 0 ? `
+
+La tarea incluye ${imagePaths.length} imagen(es) adjunta(s). Léelas con la herramienta Read para entender el contexto visual (capturas de pantalla, mockups, errores, etc.):
+${imagePaths.map((p) => `- ${p}`).join("\n")}
+
+Incorpora lo que observes en las imágenes a tu análisis.` : ""}`;
 }
 
 /**
  * Invoke Claude Code CLI to analyze the task and update Linear.
  */
-async function runClaude(task) {
-  const prompt = buildPrompt(task);
+async function runClaude(task, imagePaths = []) {
+  const prompt = buildPrompt(task, imagePaths);
 
   const allowedTools = [
     "Read",
@@ -185,8 +266,20 @@ export async function enrichTask(task) {
     console.warn(`[GIT] Pull failed (continuing anyway): ${err.message}`);
   }
 
-  // Step 2: Run Claude to analyze and update the task
-  await runClaude(task);
+  // Step 2: Download images from description
+  const imageUrls = extractImageUrls(task.description);
+  let imagePaths = [];
+  if (imageUrls.length > 0) {
+    console.log(`[IMAGES] Found ${imageUrls.length} image(s) in ${task.identifier}`);
+    imagePaths = await downloadImages(imageUrls, task.identifier);
+  }
+
+  // Step 3: Run Claude to analyze and update the task
+  try {
+    await runClaude(task, imagePaths);
+  } finally {
+    await cleanupImages(task.identifier);
+  }
 }
 
 /**
