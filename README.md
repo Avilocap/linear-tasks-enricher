@@ -1,5 +1,7 @@
 # Linear Tasks Enricher
 
+> **Note**: 100% of the code in this project was generated using artificial intelligence (Anthropic's Claude Code).
+
 A service that automatically enriches Linear tasks with technical context extracted from the codebase, using Claude Code.
 
 ## What it does
@@ -118,6 +120,3 @@ launchctl unload ~/Library/LaunchAgents/com.example.tasks-enricher-tunnel.plist
 tail -f logs/server.log
 ```
 
----
-
-> **Note**: 100% of the code in this project was generated using artificial intelligence (Anthropic's Claude Code).
