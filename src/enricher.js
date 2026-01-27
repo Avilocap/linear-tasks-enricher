@@ -230,30 +230,35 @@ async function transcribeVideo(url, taskIdentifier, index) {
 
   const { text } = await whisperRes.json();
   console.log(`[VIDEO] Transcription: ${text.slice(0, 100)}...`);
-  return text;
+
+  // Save transcription to file to avoid ARG_MAX limits on long videos
+  const transcriptPath = path.join(taskDir, `transcription-${index}.txt`);
+  await fs.writeFile(transcriptPath, text, "utf-8");
+  console.log(`[VIDEO] Transcription saved: ${transcriptPath}`);
+  return transcriptPath;
 }
 
 /**
  * Process all video URLs from a task description.
- * Returns array of transcription strings.
+ * Returns array of transcription file paths.
  */
 async function processVideos(description, taskIdentifier) {
   const videoUrls = extractVideoUrls(description);
   if (videoUrls.length === 0) return [];
 
   console.log(`[VIDEO] Found ${videoUrls.length} video(s) in ${taskIdentifier}`);
-  const transcriptions = [];
+  const transcriptionPaths = [];
 
   for (let i = 0; i < videoUrls.length; i++) {
     try {
-      const text = await transcribeVideo(videoUrls[i], taskIdentifier, i + 1);
-      if (text) transcriptions.push(text);
+      const filePath = await transcribeVideo(videoUrls[i], taskIdentifier, i + 1);
+      if (filePath) transcriptionPaths.push(filePath);
     } catch (err) {
       console.warn(`[VIDEO] Error processing video ${i + 1}: ${err.message}`);
     }
   }
 
-  return transcriptions;
+  return transcriptionPaths;
 }
 
 /**
@@ -271,7 +276,7 @@ async function cleanupMedia(taskIdentifier) {
 /**
  * Build the prompt that Claude will use to analyze the task and update it.
  */
-function buildPrompt(task, imagePaths = [], transcriptions = []) {
+function buildPrompt(task, imagePaths = [], transcriptionPaths = []) {
   return `Eres un asistente de ingeniería que enriquece tareas de Linear con contexto técnico. Responde siempre en español.
 
 Se ha creado una nueva tarea:
@@ -343,10 +348,10 @@ Importante:
 La tarea incluye ${imagePaths.length} imagen(es) adjunta(s). Léelas con la herramienta Read para entender el contexto visual (capturas de pantalla, mockups, errores, etc.):
 ${imagePaths.map((p) => `- ${p}`).join("\n")}
 
-Incorpora lo que observes en las imágenes a tu análisis.` : ""}${transcriptions.length > 0 ? `
+Incorpora lo que observes en las imágenes a tu análisis.` : ""}${transcriptionPaths.length > 0 ? `
 
-La tarea incluye ${transcriptions.length} vídeo(s) con audio. A continuación las transcripciones:
-${transcriptions.map((t, i) => `\n**Vídeo ${i + 1}:**\n${t}`).join("\n")}
+La tarea incluye ${transcriptionPaths.length} vídeo(s) con audio. Las transcripciones están guardadas en archivos. Léelas con la herramienta Read para entender el contexto:
+${transcriptionPaths.map((p) => `- ${p}`).join("\n")}
 
 Incorpora el contenido de las transcripciones a tu análisis.` : ""}`;
 }
@@ -354,8 +359,8 @@ Incorpora el contenido de las transcripciones a tu análisis.` : ""}`;
 /**
  * Invoke Claude Code CLI to analyze the task and update Linear.
  */
-async function runClaude(task, imagePaths = [], transcriptions = []) {
-  const prompt = buildPrompt(task, imagePaths, transcriptions);
+async function runClaude(task, imagePaths = [], transcriptionPaths = []) {
+  const prompt = buildPrompt(task, imagePaths, transcriptionPaths);
 
   const allowedTools = [
     "Read",
@@ -447,7 +452,7 @@ export async function enrichTask(task) {
 
   // Step 2: Detect videos first (so we can exclude them from image extraction)
   const videoUrls = extractVideoUrls(task.description);
-  const transcriptions = videoUrls.length > 0
+  const transcriptionPaths = videoUrls.length > 0
     ? await processVideos(task.description, task.identifier)
     : [];
 
@@ -461,7 +466,7 @@ export async function enrichTask(task) {
 
   // Step 4: Run Claude to analyze and update the task
   try {
-    await runClaude(task, imagePaths, transcriptions);
+    await runClaude(task, imagePaths, transcriptionPaths);
   } finally {
     await cleanupMedia(task.identifier);
   }
