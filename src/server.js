@@ -6,6 +6,7 @@ import { implementTask, cleanupForBranch } from "./implementer.js";
 const app = express();
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_SECRET = process.env.LINEAR_WEBHOOK_SECRET;
+const COMMENT_WEBHOOK_SECRET = process.env.LINEAR_COMMENT_WEBHOOK_SECRET;
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const TEAM_KEY = process.env.LINEAR_TEAM_KEY || "";
 
@@ -21,15 +22,15 @@ app.use(
   })
 );
 
-function verifyLinearSignature(req) {
-  if (!WEBHOOK_SECRET) {
-    console.warn("[WARN] LINEAR_WEBHOOK_SECRET not set — skipping verification");
+function verifyLinearSignature(req, secret = WEBHOOK_SECRET) {
+  if (!secret) {
+    console.warn("[WARN] Linear webhook secret not set — skipping verification");
     return true;
   }
   const signature = req.headers["linear-signature"];
   if (!signature) return false;
 
-  const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET);
+  const hmac = crypto.createHmac("sha256", secret);
   hmac.update(req.rawBody);
   const expected = hmac.digest("hex");
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
@@ -127,8 +128,8 @@ app.post("/enrich", async (req, res) => {
 
 // Webhook for Linear comments (Devora trigger)
 app.post("/webhook/comment", async (req, res) => {
-  // Verify webhook signature
-  if (!verifyLinearSignature(req)) {
+  // Verify webhook signature (uses separate secret for comment webhook)
+  if (!verifyLinearSignature(req, COMMENT_WEBHOOK_SECRET)) {
     console.error("[REJECT] Invalid webhook signature on /webhook/comment");
     return res.status(401).json({ error: "Invalid signature" });
   }
