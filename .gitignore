@@ -3,6 +3,7 @@ node_modules/
 z2-backend/
 z2-frontend/
 .tmp-media/
+.worktrees/
 logs/
 .DS_Store
 package-lock.json
