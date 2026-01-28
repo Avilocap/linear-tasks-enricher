@@ -430,13 +430,6 @@ export async function cleanupForBranch(branchName, merged) {
 
     try {
       await removeWorktree(wt.repo, wt.taskIdentifier);
-
-      // Comment on Linear
-      const status = merged ? "mergeada" : "cerrada";
-      await createLinearComment(
-        wt.issueId,
-        `PR ${status} para **${wt.repo}**. Worktree eliminado.`
-      );
     } catch (err) {
       console.error(`[CLEANUP] Error removing worktree:`, err.message);
     }
