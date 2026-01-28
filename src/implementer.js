@@ -35,6 +35,14 @@ export async function handleDevoraSession(sessionId, issueId, webhookData) {
       return;
     }
 
+    // Skip if issue is already completed or canceled
+    const stateType = issue.state?.type;
+    if (stateType === "completed" || stateType === "canceled") {
+      console.log(`[DEVORA] Skipping ${issue.identifier} — state is ${stateType}`);
+      await emit.response(`Tarea ${issue.identifier} ya está ${stateType === "completed" ? "completada" : "cancelada"}. No hay nada que hacer.`);
+      return;
+    }
+
     const task = {
       id: issue.id,
       identifier: issue.identifier,

@@ -64,6 +64,7 @@ export async function getIssue(agent, issueId) {
         url
         team { name key }
         labels { nodes { name } }
+        state { name type }
       }
     }
   `, { id: issueId });
