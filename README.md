@@ -2,9 +2,11 @@
 
 > **Note**: 100% of the code in this project was generated using artificial intelligence (Anthropic's Claude Code).
 
-A service that automatically enriches Linear tasks with technical context extracted from the codebase, using Claude Code.
+A service that automatically enriches Linear tasks with technical context extracted from the codebase, and can implement changes autonomously when triggered.
 
 ## What it does
+
+### Task Enrichment
 
 When a new task is created in Linear, the service:
 
@@ -22,17 +24,43 @@ When a new task is created in Linear, the service:
 
 It also supports on-demand enrichment of existing tasks.
 
+### Automatic Implementation (Devora)
+
+When a comment containing a trigger phrase is added to a task (e.g., "Devora implementa", "Devora a trabajar"), the service:
+
+1. Creates an isolated git worktree for each affected repository
+2. Invokes Claude Code to implement the changes based on the technical analysis
+3. Commits the changes and pushes to a feature branch
+4. Creates a Pull Request on GitHub with a link to the Linear task
+5. Comments on Linear with links to the created PRs
+6. Automatically cleans up worktrees when PRs are merged or closed
+
+**Trigger phrases**: `devora implementa`, `devora trabaja`, `devora desarrolla`, `devora hazlo`, `devora ejecuta`, `devora a trabajar`
+
 ## Architecture
 
 ```
-Linear webhook → Cloudflare Tunnel → Express server → Media processing → Claude Code CLI → Linear MCP update
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ENRICHMENT FLOW                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Linear (new issue) → Webhook → Media processing → Claude Code → Linear API │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            IMPLEMENTATION FLOW                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Linear (comment) → Webhook → Git worktree → Claude Code → GitHub PR        │
+│                                                                             │
+│ GitHub (PR closed) → Webhook → Cleanup worktree                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Express** receives webhooks and manual requests
+- **Express** receives webhooks from Linear and GitHub
 - **Cloudflare Tunnel** exposes the local server to the internet with a fixed URL
 - **ffmpeg + OpenAI Whisper** extract and transcribe audio from attached videos
-- **Claude Code** (`claude -p`) analyzes the codebase in non-interactive mode
-- **Linear MCP** allows Claude to read and update tasks directly
+- **Claude Code** (`claude -p`) analyzes and implements changes in non-interactive mode
+- **Git worktrees** provide isolated environments for each implementation
+- **GitHub CLI** (`gh`) creates Pull Requests automatically
 
 ## Setup
 
@@ -58,9 +86,12 @@ Edit `.env`:
 ```
 PORT=3000
 LINEAR_WEBHOOK_SECRET=your_signing_secret
+LINEAR_COMMENT_WEBHOOK_SECRET=your_comment_webhook_secret
 LINEAR_TEAM_KEY=YOUR_TEAM_KEY
 LINEAR_API_KEY=lin_api_your_key
 OPENAI_API_KEY=sk-your_key
+GITHUB_WEBHOOK_SECRET=your_github_webhook_secret
+GITHUB_TOKEN=ghp_your_token
 ```
 
 ### Cloudflare Tunnel
@@ -71,14 +102,30 @@ cloudflared tunnel create tasks-enricher
 cloudflared tunnel route dns tasks-enricher your-subdomain.yourdomain.com
 ```
 
-### Linear Webhook
+### Linear Webhooks
 
-Settings → API → Webhooks → Create webhook:
+Settings → API → Webhooks → Create two webhooks:
+
+**1. Issue webhook (enrichment)**
 - **URL**: `https://your-subdomain.yourdomain.com/webhook`
 - **Resource types**: Issues
 - **Actions**: Create
+- Copy signing secret to `LINEAR_WEBHOOK_SECRET`
 
-Copy the signing secret to `LINEAR_WEBHOOK_SECRET` in `.env`.
+**2. Comment webhook (Devora trigger)**
+- **URL**: `https://your-subdomain.yourdomain.com/webhook/comment`
+- **Resource types**: Comments
+- Copy signing secret to `LINEAR_COMMENT_WEBHOOK_SECRET`
+
+### GitHub Webhooks
+
+For each repository (e.g., `z2-backend`, `z2-frontend`):
+
+Settings → Webhooks → Add webhook:
+- **URL**: `https://your-subdomain.yourdomain.com/webhook/github`
+- **Content type**: `application/json`
+- **Secret**: Same value for all repos, save to `GITHUB_WEBHOOK_SECRET`
+- **Events**: Select "Pull requests" only
 
 ### Start
 
@@ -92,7 +139,9 @@ For unattended execution on macOS, use launchd (see section below).
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/webhook` | Linear signature | Receives Linear webhooks |
+| `POST` | `/webhook` | Linear signature | Receives Linear issue webhooks (enrichment) |
+| `POST` | `/webhook/comment` | Linear signature | Receives Linear comment webhooks (Devora trigger) |
+| `POST` | `/webhook/github` | GitHub signature | Receives GitHub PR webhooks (cleanup) |
 | `POST` | `/enrich` | Bearer token | Enriches existing tasks on demand |
 | `GET` | `/health` | — | Health check |
 
