@@ -231,11 +231,13 @@ async function runClaudeImplementation(task, repo, worktreePath) {
 }
 
 /**
- * Check if there are changes to commit.
+ * Check if there are new commits compared to origin/main.
  */
-async function hasChanges(worktreePath) {
-  const result = await exec("git", ["status", "--porcelain"], { cwd: worktreePath });
-  return result.stdout.trim().length > 0;
+async function hasNewCommits(worktreePath) {
+  // Check if HEAD is ahead of origin/main
+  const result = await exec("git", ["rev-list", "--count", "origin/main..HEAD"], { cwd: worktreePath });
+  const count = parseInt(result.stdout.trim(), 10);
+  return count > 0;
 }
 
 /**
@@ -360,17 +362,14 @@ Analizando la tarea y preparando el entorno de desarrollo.`);
       // Run Claude to implement
       await runClaudeImplementation(issue, repo, worktreePath);
 
-      // Check if there are changes
-      if (!(await hasChanges(worktreePath))) {
-        console.log(`[IMPLEMENT] No changes made in ${repoName}`);
+      // Check if Claude made any commits
+      if (!(await hasNewCommits(worktreePath))) {
+        console.log(`[IMPLEMENT] No commits made in ${repoName}`);
         await removeWorktree(repoName, issue.identifier);
         continue;
       }
 
-      // Commit changes
-      await commitChanges(worktreePath, issue);
-
-      // Push and create PR
+      // Push and create PR (Claude already made commits)
       const prUrl = await pushAndCreatePR(worktreePath, branchName, issue, repo);
 
       // Register worktree
