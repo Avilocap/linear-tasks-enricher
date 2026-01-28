@@ -4,3 +4,5 @@ z2-backend/
 z2-frontend/
 .tmp-media/
 logs/
+.DS_Store
+package-lock.json
