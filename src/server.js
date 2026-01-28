@@ -1,17 +1,29 @@
 import express from "express";
 import crypto from "node:crypto";
-import { enrichTask, enrichTaskByIdentifier } from "./enricher.js";
-import { implementTask, cleanupForBranch } from "./implementer.js";
+import { handleEnriqueSession } from "./enricher.js";
+import { handleDevoraSession, cleanupForBranch } from "./implementer.js";
+import { setTokens, setAppUserId } from "./token-store.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_SECRET = process.env.LINEAR_WEBHOOK_SECRET;
-const COMMENT_WEBHOOK_SECRET = process.env.LINEAR_COMMENT_WEBHOOK_SECRET;
-const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
-const TEAM_KEY = process.env.LINEAR_TEAM_KEY || "";
 
-// Regex to detect "Devora" trigger with action verbs
-const DEVORA_TRIGGER = /\bdevora\b.*\b(implementa|trabaja|desarrolla|hazlo|ejecuta|a trabajar)\b/i;
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
+const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI;
+
+const AGENTS = {
+  enrique: {
+    clientId: process.env.ENRIQUE_CLIENT_ID,
+    clientSecret: process.env.ENRIQUE_CLIENT_SECRET,
+    webhookSecret: process.env.ENRIQUE_WEBHOOK_SECRET,
+    handler: handleEnriqueSession,
+  },
+  devora: {
+    clientId: process.env.DEVORA_CLIENT_ID,
+    clientSecret: process.env.DEVORA_CLIENT_SECRET,
+    webhookSecret: process.env.DEVORA_WEBHOOK_SECRET,
+    handler: handleDevoraSession,
+  },
+};
 
 // Parse raw body for signature verification, then JSON
 app.use(
@@ -22,9 +34,11 @@ app.use(
   })
 );
 
-function verifyLinearSignature(req, secret = WEBHOOK_SECRET) {
+// ─── Signature verification ────────────────────────────────────────────
+
+function verifyLinearSignature(req, secret) {
   if (!secret) {
-    console.warn("[WARN] Linear webhook secret not set — skipping verification");
+    console.warn("[WARN] Webhook secret not set — skipping verification");
     return true;
   }
   const signature = req.headers["linear-signature"];
@@ -33,7 +47,11 @@ function verifyLinearSignature(req, secret = WEBHOOK_SECRET) {
   const hmac = crypto.createHmac("sha256", secret);
   hmac.update(req.rawBody);
   const expected = hmac.digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }
 
 function verifyGitHubSignature(req) {
@@ -55,123 +73,137 @@ function verifyGitHubSignature(req) {
   }
 }
 
-app.post("/webhook", async (req, res) => {
-  // Verify webhook signature
-  if (!verifyLinearSignature(req)) {
-    console.error("[REJECT] Invalid webhook signature");
-    return res.status(401).json({ error: "Invalid signature" });
+// ─── OAuth install & callback ──────────────────────────────────────────
+
+app.get("/oauth/install/:agent", (req, res) => {
+  const agentName = req.params.agent.toLowerCase();
+  const agent = AGENTS[agentName];
+
+  if (!agent || !agent.clientId) {
+    return res.status(404).json({ error: `Unknown agent: ${agentName}` });
   }
 
-  const { action, type, data } = req.body;
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: agent.clientId,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    scope: "read,write,app:assignable,app:mentionable",
+    state: agentName,
+    actor: "app",
+  });
 
-  console.log(`[WEBHOOK] action=${action} type=${type} id=${data?.id}`);
+  const url = `https://linear.app/oauth/authorize?${params}`;
+  console.log(`[OAUTH] Redirecting to Linear OAuth for ${agentName}`);
+  res.redirect(url);
+});
 
-  // Only process issue creation events
-  if (type !== "Issue" || action !== "create") {
-    return res.status(200).json({ ok: true, skipped: true });
+app.get("/oauth/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const agentName = (state || "").toLowerCase();
+  const agent = AGENTS[agentName];
+
+  if (!agent || !code) {
+    return res.status(400).json({ error: "Missing code or invalid state" });
   }
-
-  // Filter by team if configured
-  if (TEAM_KEY && data?.team?.key !== TEAM_KEY) {
-    console.log(`[SKIP] Team ${data?.team?.key} does not match ${TEAM_KEY}`);
-    return res.status(200).json({ ok: true, skipped: true });
-  }
-
-  // Respond immediately — enrichment runs async
-  res.status(200).json({ ok: true, processing: true });
-
-  const taskInfo = {
-    id: data.id,
-    identifier: data.identifier,
-    title: data.title,
-    description: data.description || "",
-    priority: data.priority,
-    labels: data.labels?.map((l) => l.name) || [],
-    teamName: data.team?.name || "",
-    teamKey: data.team?.key || "",
-    url: data.url || "",
-  };
-
-  console.log(`[ENRICH] Starting enrichment for ${taskInfo.identifier}: ${taskInfo.title}`);
 
   try {
-    await enrichTask(taskInfo);
-    console.log(`[ENRICH] Completed for ${taskInfo.identifier}`);
-  } catch (err) {
-    console.error(`[ENRICH] Failed for ${taskInfo.identifier}:`, err.message);
-  }
-});
-
-// Manual enrichment: POST /enrich { "issues": ["Z2DND-123", "Z2DND-456"] }
-app.post("/enrich", async (req, res) => {
-  const token = req.headers["authorization"]?.replace("Bearer ", "");
-  if (!WEBHOOK_SECRET || token !== WEBHOOK_SECRET) {
-    console.error("[REJECT] Invalid or missing bearer token on /enrich");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  const { issues } = req.body;
-
-  if (!Array.isArray(issues) || issues.length === 0) {
-    return res.status(400).json({ error: "Provide an 'issues' array with identifiers" });
-  }
-
-  res.status(200).json({ ok: true, processing: issues });
-
-  for (const identifier of issues) {
-    console.log(`[MANUAL] Queued enrichment for ${identifier}`);
-    enrichTaskByIdentifier(identifier).catch((err) => {
-      console.error(`[MANUAL] Failed for ${identifier}:`, err.message);
+    // Exchange code for tokens
+    const tokenRes = await fetch("https://api.linear.app/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: agent.clientId,
+        client_secret: agent.clientSecret,
+        redirect_uri: OAUTH_REDIRECT_URI,
+        code,
+      }),
     });
+
+    if (!tokenRes.ok) {
+      const errBody = await tokenRes.text();
+      console.error(`[OAUTH] Token exchange failed for ${agentName}: ${tokenRes.status} ${errBody}`);
+      return res.status(500).json({ error: "Token exchange failed" });
+    }
+
+    const tokenData = await tokenRes.json();
+    await setTokens(agentName, tokenData);
+
+    // Fetch the appUser ID for this agent
+    const meRes = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${tokenData.access_token}`,
+      },
+      body: JSON.stringify({
+        query: `{ appUser { id name } }`,
+      }),
+    });
+
+    if (meRes.ok) {
+      const meData = await meRes.json();
+      const appUser = meData.data?.appUser;
+      if (appUser?.id) {
+        await setAppUserId(agentName, appUser.id);
+      }
+    }
+
+    console.log(`[OAUTH] ${agentName} installed successfully`);
+    res.json({ ok: true, agent: agentName, message: "Agent installed successfully" });
+  } catch (err) {
+    console.error(`[OAUTH] Error during callback for ${agentName}:`, err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Webhook for Linear comments (Devora trigger)
-app.post("/webhook/comment", async (req, res) => {
-  // Verify webhook signature (uses separate secret for comment webhook)
-  if (!verifyLinearSignature(req, COMMENT_WEBHOOK_SECRET)) {
-    console.error("[REJECT] Invalid webhook signature on /webhook/comment");
-    return res.status(401).json({ error: "Invalid signature" });
-  }
+// ─── Agent session webhooks ────────────────────────────────────────────
 
-  const { action, type, data } = req.body;
+function createAgentWebhookHandler(agentName) {
+  return async (req, res) => {
+    const agent = AGENTS[agentName];
 
-  console.log(`[WEBHOOK/COMMENT] action=${action} type=${type}`);
+    if (!verifyLinearSignature(req, agent.webhookSecret)) {
+      console.error(`[REJECT] Invalid signature on /webhook/agent/${agentName}`);
+      return res.status(401).json({ error: "Invalid signature" });
+    }
 
-  // Only process comment creation events
-  if (type !== "Comment" || action !== "create") {
-    return res.status(200).json({ ok: true, skipped: true });
-  }
+    const { action, type, agentSession } = req.body;
 
-  const commentBody = data?.body || "";
-  const issueId = data?.issue?.id;
-  const commentId = data?.id;
+    console.log(`[WEBHOOK/${agentName.toUpperCase()}] action=${action} type=${type} session=${agentSession?.id}`);
 
-  // Check for Devora trigger
-  if (!DEVORA_TRIGGER.test(commentBody)) {
-    console.log(`[WEBHOOK/COMMENT] No Devora trigger in comment`);
-    return res.status(200).json({ ok: true, skipped: true });
-  }
+    if (type !== "AgentSession" && type !== "AgentSessionEvent") {
+      return res.status(200).json({ ok: true, skipped: true });
+    }
 
-  if (!issueId) {
-    console.error("[WEBHOOK/COMMENT] No issue ID in comment data");
-    return res.status(400).json({ error: "No issue ID" });
-  }
+    // Respond immediately (must be <5 sec)
+    res.status(200).json({ ok: true, processing: true });
 
-  console.log(`[WEBHOOK/COMMENT] Devora trigger detected for issue ${issueId}`);
+    const sessionId = agentSession?.id;
+    const issueId = agentSession?.issueId || agentSession?.issue?.id;
+    const data = req.body;
 
-  // Respond immediately — implementation runs async
-  res.status(200).json({ ok: true, implementing: true });
+    if (!sessionId) {
+      console.error(`[WEBHOOK/${agentName.toUpperCase()}] No sessionId in payload`);
+      return;
+    }
 
-  // Run implementation asynchronously
-  implementTask(issueId, commentId).catch((err) => {
-    console.error(`[IMPLEMENT] Failed for issue ${issueId}:`, err.message);
-  });
-});
+    if (action === "created" || action === "prompted") {
+      agent.handler(sessionId, issueId, data).catch((err) => {
+        console.error(`[${agentName.toUpperCase()}] Pipeline failed:`, err.message);
+      });
+    } else {
+      console.log(`[WEBHOOK/${agentName.toUpperCase()}] Ignoring action: ${action}`);
+    }
+  };
+}
 
-// Webhook for GitHub PR events (cleanup worktrees)
+app.post("/webhook/agent/enrique", createAgentWebhookHandler("enrique"));
+app.post("/webhook/agent/devora", createAgentWebhookHandler("devora"));
+
+// ─── GitHub PR webhook (cleanup) ──────────────────────────────────────
+
 app.post("/webhook/github", async (req, res) => {
-  // Verify webhook signature
   if (!verifyGitHubSignature(req)) {
     console.error("[REJECT] Invalid webhook signature on /webhook/github");
     return res.status(401).json({ error: "Invalid signature" });
@@ -182,12 +214,10 @@ app.post("/webhook/github", async (req, res) => {
 
   console.log(`[WEBHOOK/GITHUB] event=${event} action=${action}`);
 
-  // Only process pull_request events
   if (event !== "pull_request") {
     return res.status(200).json({ ok: true, skipped: true });
   }
 
-  // Only process closed PRs (merged or just closed)
   if (action !== "closed") {
     return res.status(200).json({ ok: true, skipped: true });
   }
@@ -202,35 +232,41 @@ app.post("/webhook/github", async (req, res) => {
 
   console.log(`[WEBHOOK/GITHUB] PR ${merged ? "merged" : "closed"}: ${branchName}`);
 
-  // Respond immediately — cleanup runs async
   res.status(200).json({ ok: true, cleaning: true });
 
-  // Run cleanup asynchronously
   cleanupForBranch(branchName, merged).catch((err) => {
     console.error(`[CLEANUP] Failed for branch ${branchName}:`, err.message);
   });
 });
 
-// Health check
+// ─── Health ────────────────────────────────────────────────────────────
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
+// ─── Start ─────────────────────────────────────────────────────────────
+
 app.listen(PORT, () => {
   console.log(`[SERVER] Listening on port ${PORT}`);
   console.log(`[SERVER] Endpoints:`);
-  console.log(`[SERVER]   POST /webhook         - Linear issue webhooks (enrichment)`);
-  console.log(`[SERVER]   POST /webhook/comment - Linear comment webhooks (Devora trigger)`);
-  console.log(`[SERVER]   POST /webhook/github  - GitHub PR webhooks (cleanup)`);
-  console.log(`[SERVER]   POST /enrich          - Manual enrichment`);
-  console.log(`[SERVER]   GET  /health          - Health check`);
-  if (!WEBHOOK_SECRET) {
-    console.warn("[SERVER] WARNING: LINEAR_WEBHOOK_SECRET not set — signatures not verified");
+  console.log(`[SERVER]   GET  /oauth/install/:agent  - Start OAuth install`);
+  console.log(`[SERVER]   GET  /oauth/callback        - OAuth callback`);
+  console.log(`[SERVER]   POST /webhook/agent/enrique - Enrique agent sessions`);
+  console.log(`[SERVER]   POST /webhook/agent/devora  - Devora agent sessions`);
+  console.log(`[SERVER]   POST /webhook/github        - GitHub PR cleanup`);
+  console.log(`[SERVER]   GET  /health                - Health check`);
+
+  for (const [name, agent] of Object.entries(AGENTS)) {
+    if (!agent.clientId) {
+      console.warn(`[SERVER] WARNING: ${name.toUpperCase()} OAuth not configured (missing CLIENT_ID)`);
+    }
+    if (!agent.webhookSecret) {
+      console.warn(`[SERVER] WARNING: ${name.toUpperCase()} webhook secret not set`);
+    }
   }
+
   if (!GITHUB_WEBHOOK_SECRET) {
-    console.warn("[SERVER] WARNING: GITHUB_WEBHOOK_SECRET not set — GitHub signatures not verified");
-  }
-  if (TEAM_KEY) {
-    console.log(`[SERVER] Filtering for team: ${TEAM_KEY}`);
+    console.warn("[SERVER] WARNING: GITHUB_WEBHOOK_SECRET not set");
   }
 });
