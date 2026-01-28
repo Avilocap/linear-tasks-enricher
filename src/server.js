@@ -1,11 +1,16 @@
 import express from "express";
 import crypto from "node:crypto";
 import { enrichTask, enrichTaskByIdentifier } from "./enricher.js";
+import { implementTask, cleanupForBranch } from "./implementer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_SECRET = process.env.LINEAR_WEBHOOK_SECRET;
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const TEAM_KEY = process.env.LINEAR_TEAM_KEY || "";
+
+// Regex to detect "Devora" trigger with action verbs
+const DEVORA_TRIGGER = /\bdevora\b.*\b(implementa|trabaja|desarrolla|hazlo|ejecuta|a trabajar)\b/i;
 
 // Parse raw body for signature verification, then JSON
 app.use(
@@ -16,7 +21,7 @@ app.use(
   })
 );
 
-function verifySignature(req) {
+function verifyLinearSignature(req) {
   if (!WEBHOOK_SECRET) {
     console.warn("[WARN] LINEAR_WEBHOOK_SECRET not set — skipping verification");
     return true;
@@ -30,9 +35,28 @@ function verifySignature(req) {
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
+function verifyGitHubSignature(req) {
+  if (!GITHUB_WEBHOOK_SECRET) {
+    console.warn("[WARN] GITHUB_WEBHOOK_SECRET not set — skipping verification");
+    return true;
+  }
+  const signature = req.headers["x-hub-signature-256"];
+  if (!signature) return false;
+
+  const hmac = crypto.createHmac("sha256", GITHUB_WEBHOOK_SECRET);
+  hmac.update(req.rawBody);
+  const expected = `sha256=${hmac.digest("hex")}`;
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
 app.post("/webhook", async (req, res) => {
   // Verify webhook signature
-  if (!verifySignature(req)) {
+  if (!verifyLinearSignature(req)) {
     console.error("[REJECT] Invalid webhook signature");
     return res.status(401).json({ error: "Invalid signature" });
   }
@@ -101,6 +125,91 @@ app.post("/enrich", async (req, res) => {
   }
 });
 
+// Webhook for Linear comments (Devora trigger)
+app.post("/webhook/comment", async (req, res) => {
+  // Verify webhook signature
+  if (!verifyLinearSignature(req)) {
+    console.error("[REJECT] Invalid webhook signature on /webhook/comment");
+    return res.status(401).json({ error: "Invalid signature" });
+  }
+
+  const { action, type, data } = req.body;
+
+  console.log(`[WEBHOOK/COMMENT] action=${action} type=${type}`);
+
+  // Only process comment creation events
+  if (type !== "Comment" || action !== "create") {
+    return res.status(200).json({ ok: true, skipped: true });
+  }
+
+  const commentBody = data?.body || "";
+  const issueId = data?.issue?.id;
+  const commentId = data?.id;
+
+  // Check for Devora trigger
+  if (!DEVORA_TRIGGER.test(commentBody)) {
+    console.log(`[WEBHOOK/COMMENT] No Devora trigger in comment`);
+    return res.status(200).json({ ok: true, skipped: true });
+  }
+
+  if (!issueId) {
+    console.error("[WEBHOOK/COMMENT] No issue ID in comment data");
+    return res.status(400).json({ error: "No issue ID" });
+  }
+
+  console.log(`[WEBHOOK/COMMENT] Devora trigger detected for issue ${issueId}`);
+
+  // Respond immediately — implementation runs async
+  res.status(200).json({ ok: true, implementing: true });
+
+  // Run implementation asynchronously
+  implementTask(issueId, commentId).catch((err) => {
+    console.error(`[IMPLEMENT] Failed for issue ${issueId}:`, err.message);
+  });
+});
+
+// Webhook for GitHub PR events (cleanup worktrees)
+app.post("/webhook/github", async (req, res) => {
+  // Verify webhook signature
+  if (!verifyGitHubSignature(req)) {
+    console.error("[REJECT] Invalid webhook signature on /webhook/github");
+    return res.status(401).json({ error: "Invalid signature" });
+  }
+
+  const event = req.headers["x-github-event"];
+  const { action, pull_request } = req.body;
+
+  console.log(`[WEBHOOK/GITHUB] event=${event} action=${action}`);
+
+  // Only process pull_request events
+  if (event !== "pull_request") {
+    return res.status(200).json({ ok: true, skipped: true });
+  }
+
+  // Only process closed PRs (merged or just closed)
+  if (action !== "closed") {
+    return res.status(200).json({ ok: true, skipped: true });
+  }
+
+  const branchName = pull_request?.head?.ref;
+  const merged = pull_request?.merged || false;
+
+  if (!branchName) {
+    console.error("[WEBHOOK/GITHUB] No branch name in PR data");
+    return res.status(400).json({ error: "No branch name" });
+  }
+
+  console.log(`[WEBHOOK/GITHUB] PR ${merged ? "merged" : "closed"}: ${branchName}`);
+
+  // Respond immediately — cleanup runs async
+  res.status(200).json({ ok: true, cleaning: true });
+
+  // Run cleanup asynchronously
+  cleanupForBranch(branchName, merged).catch((err) => {
+    console.error(`[CLEANUP] Failed for branch ${branchName}:`, err.message);
+  });
+});
+
 // Health check
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
@@ -108,10 +217,17 @@ app.get("/health", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[SERVER] Listening on port ${PORT}`);
-  console.log(`[SERVER] Webhook endpoint: POST /webhook`);
-  console.log(`[SERVER] Health check:     GET  /health`);
+  console.log(`[SERVER] Endpoints:`);
+  console.log(`[SERVER]   POST /webhook         - Linear issue webhooks (enrichment)`);
+  console.log(`[SERVER]   POST /webhook/comment - Linear comment webhooks (Devora trigger)`);
+  console.log(`[SERVER]   POST /webhook/github  - GitHub PR webhooks (cleanup)`);
+  console.log(`[SERVER]   POST /enrich          - Manual enrichment`);
+  console.log(`[SERVER]   GET  /health          - Health check`);
   if (!WEBHOOK_SECRET) {
     console.warn("[SERVER] WARNING: LINEAR_WEBHOOK_SECRET not set — signatures not verified");
+  }
+  if (!GITHUB_WEBHOOK_SECRET) {
+    console.warn("[SERVER] WARNING: GITHUB_WEBHOOK_SECRET not set — GitHub signatures not verified");
   }
   if (TEAM_KEY) {
     console.log(`[SERVER] Filtering for team: ${TEAM_KEY}`);
